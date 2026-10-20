@@ -30,6 +30,7 @@ import (
 	"github.com/charmbracelet/crush/internal/discover"
 	"github.com/charmbracelet/crush/internal/event"
 	"github.com/charmbracelet/crush/internal/filetracker"
+	"github.com/charmbracelet/crush/internal/harness"
 	"github.com/charmbracelet/crush/internal/history"
 	"github.com/charmbracelet/crush/internal/hooks"
 	"github.com/charmbracelet/crush/internal/log"
@@ -161,6 +162,11 @@ type coordinator struct {
 	runComplete pubsub.Publisher[notify.RunComplete]
 	interactive bool
 
+	// Harness² RSI & Self-Improvement
+	harness          *harness.ActiveHarness
+	harnessEngine    *harness.Engine
+	baseSystemPrompt string
+
 	// agentMu guards mainAgent and mainAgentName: SetMainAgent runs on
 	// HTTP handler goroutines while runs, cancels, and probes read the
 	// current agent from their own goroutines.
@@ -225,6 +231,15 @@ func NewCoordinator(ctx context.Context, opts CoordinatorOptions) (Coordinator, 
 		activeSkills: activeSkills,
 		skillTracker: skillTracker,
 		interactive:  opts.Interactive,
+	}
+
+	// Initialize Harness² Active Harness & RSI Engine
+	harnessDir := filepath.Join(opts.Config.WorkingDir(), ".crush", "harness")
+	if h, err := harness.InitOrLoad(harnessDir); err == nil {
+		c.harness = h
+		c.harnessEngine = harness.NewEngine(h, c.callHarnessLLM)
+	} else {
+		slog.Warn("Failed to initialize Harness² active harness", "error", err)
 	}
 
 	agentCfg, ok := opts.Config.Config().Agents[config.AgentCoder]
@@ -310,6 +325,13 @@ func (c *coordinator) RunAccepted(ctx context.Context, accept *AcceptedRun, sess
 func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID string, prompt string, attachments ...message.Attachment) (*fantasy.AgentResult, error) {
 	if err := c.readyWg.Wait(); err != nil {
 		return nil, err
+	}
+
+	// Harness² Explicit Command Interceptor (/evolve, /exp, /rules, /harness)
+	if c.harness != nil {
+		if respText, matched := harness.HandleExplicitCommand(ctx, prompt, c.harness, c.callHarnessLLM); matched {
+			return c.handleHarnessExplicitResponse(ctx, sessionID, prompt, respText)
+		}
 	}
 
 	// MCP servers connect asynchronously (see mcp.Initialize).
@@ -410,6 +432,24 @@ func (c *coordinator) run(ctx context.Context, accept *AcceptedRun, sessionID st
 	beforeLoaded := c.skillTracker.LoadedNames()
 	result, originalErr := run()
 	logTurnSkillUsage(sessionID, prompt, c.activeSkills, c.skillTracker, beforeLoaded)
+
+	// Harness² Implicit Conversational RSI Trigger (runs in background on errors, corrections, discoveries)
+	if originalErr == nil && result != nil && c.harnessEngine != nil {
+		turn := c.extractHarnessTurn(prompt, result)
+		c.harnessEngine.AnalyzeAndEvolveAsync(turn, func(exp harness.ExperienceEntry) {
+			c.agentMu.RLock()
+			for _, ag := range c.agents {
+				ag.SetSystemPrompt(c.harness.AugmentSystemPrompt(c.baseSystemPrompt))
+			}
+			c.agentMu.RUnlock()
+		}, func(rule string) {
+			c.agentMu.RLock()
+			for _, ag := range c.agents {
+				ag.SetSystemPrompt(c.harness.AugmentSystemPrompt(c.baseSystemPrompt))
+			}
+			c.agentMu.RUnlock()
+		})
+	}
 
 	// Notify only if still unauthorized after retry — a successful
 	// retry means the user doesn't need to re-authenticate. AWS SSO is
@@ -828,6 +868,10 @@ func (c *coordinator) buildAgent(ctx context.Context, prompt *prompt.Prompt, age
 		systemPrompt, err := prompt.Build(initCtx, large.Model.Provider(), large.Model.Model(), c.cfg)
 		if err != nil {
 			return err
+		}
+		c.baseSystemPrompt = systemPrompt
+		if c.harness != nil {
+			systemPrompt = c.harness.AugmentSystemPrompt(systemPrompt)
 		}
 		result.SetSystemPrompt(systemPrompt)
 		return nil
@@ -1879,4 +1923,99 @@ func logDiscoveryStats(
 		"prompt_tok_est", skills.ApproxTokenCount(xml),
 		"active_names", activeNames,
 	)
+}
+
+// callHarnessLLM allows Harness² to call Crush's configured large model for meta-reflections.
+func (c *coordinator) callHarnessLLM(ctx context.Context, sysPrompt, userPrompt string) (string, error) {
+	large, _, err := c.buildAgentModels(ctx, false)
+	if err != nil {
+		return "", err
+	}
+
+	call := fantasy.Call{
+		Prompt: fantasy.Prompt{
+			fantasy.NewSystemMessage(sysPrompt),
+			fantasy.NewUserMessage(userPrompt),
+		},
+	}
+	resp, err := large.Model.Generate(ctx, call)
+	if err != nil {
+		return "", err
+	}
+	return resp.Content.Text(), nil
+}
+
+// handleHarnessExplicitResponse formats and persists the output of explicit commands (/evolve, /exp, /rules, /harness).
+func (c *coordinator) handleHarnessExplicitResponse(ctx context.Context, sessionID, prompt, respText string) (*fantasy.AgentResult, error) {
+	// Persist user prompt
+	_, _ = c.messages.Create(ctx, sessionID, message.CreateMessageParams{
+		Role: message.User,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: prompt},
+		},
+	})
+
+	// Persist assistant message
+	large, _, _ := c.buildAgentModels(ctx, false)
+	assistantMsg, err := c.messages.Create(ctx, sessionID, message.CreateMessageParams{
+		Role:     message.Assistant,
+		Model:    large.ModelCfg.Model,
+		Provider: large.ModelCfg.Provider,
+		Parts: []message.ContentPart{
+			message.TextContent{Text: respText},
+		},
+	})
+	if err == nil {
+		assistantMsg.FinishThinking()
+		_ = c.messages.Update(ctx, assistantMsg)
+	}
+
+	result := &fantasy.AgentResult{
+		Response: fantasy.Response{
+			Content: fantasy.ResponseContent{
+				fantasy.TextContent{Text: respText},
+			},
+		},
+	}
+
+	if c.runComplete != nil {
+		c.runComplete.PublishMustDeliver(ctx, pubsub.UpdatedEvent, notify.RunComplete{
+			SessionID: sessionID,
+			RunID:     RunIDFromContext(ctx),
+			MessageID: assistantMsg.ID,
+			Text:      respText,
+		})
+		MarkRunCompletePublished(ctx)
+	}
+
+	return result, nil
+}
+
+// extractHarnessTurn collects tool calls, arguments, and outputs from an execution for RSI reflection.
+func (c *coordinator) extractHarnessTurn(userPrompt string, result *fantasy.AgentResult) harness.Turn {
+	turn := harness.Turn{
+		UserMessage: userPrompt,
+	}
+	if result != nil {
+		turn.AssistantReply = result.Response.Content.Text()
+		for _, step := range result.Steps {
+			for _, msg := range step.Messages {
+				for _, part := range msg.Content {
+					switch p := part.(type) {
+					case fantasy.ToolCallPart:
+						turn.Tools = append(turn.Tools, harness.ToolRecord{
+							Name: p.ToolName,
+							Args: p.Input,
+						})
+					case fantasy.ToolResultPart:
+						if len(turn.Tools) > 0 {
+							outStr := fmt.Sprint(p.Output)
+							turn.Tools[len(turn.Tools)-1].Output = outStr
+						}
+					}
+				}
+			}
+		}
+	}
+	return turn
 }

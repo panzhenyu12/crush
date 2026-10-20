@@ -456,6 +456,12 @@ func (c *Commands) defaultCommands() []*CommandItem {
 	// Only show compact command if there's an active session
 	if c.hasSession {
 		commands = append(commands, NewCommandItem(c.com.Styles, "summarize", "Summarize Session", "", ActionSummarize{SessionID: c.sessionID}))
+		commands = append(commands,
+			NewCommandItem(c.com.Styles, "harness_evolve", "Harness² Evolve", "", ActionRunCustomCommand{Content: "/evolve"}).WithDescription("Trigger recursive self-improvement cycle (Propose -> Probe -> Compose)"),
+			NewCommandItem(c.com.Styles, "harness_exp", "Harness² Experiences", "", ActionRunCustomCommand{Content: "/exp"}).WithDescription("View learned continual improvement memory"),
+			NewCommandItem(c.com.Styles, "harness_rules", "Harness² Rules", "", ActionRunCustomCommand{Content: "/rules"}).WithDescription("View active engineering rules and constraints"),
+			NewCommandItem(c.com.Styles, "harness_status", "Harness² Status", "", ActionRunCustomCommand{Content: "/harness"}).WithDescription("View editable harness architecture status"),
+		)
 	}
 
 	// Add reasoning toggle for models that support it
